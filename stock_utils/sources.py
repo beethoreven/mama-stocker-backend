@@ -12,9 +12,9 @@
 
 ## 快取
 
-這些資料一天只變一次（收盤後），所以整包抓下來放記憶體，過期才重抓。
-webhook 有 5 秒的預算，而這裡每一支實測都在 1 秒內；app.py 開機時會先在
-背景把全市場的那幾包抓好，第一個使用者不必等。
+這些資料一天只變一次（收盤後），所以整包抓下來放記憶體。過期之後的第一個人
+拿到的是舊資料、同時背景重抓，不必等（見 _cached）。app.py 會在第一個請求
+進來時先把全市場的那幾包抓好。
 
 ★ 抓失敗時**舊資料繼續用**，不把例外往外拋——證交所偶爾會擋連線，
   回昨天的數字比回「查不到」有用。從來沒抓成功過才會拋。
@@ -54,6 +54,8 @@ _DIVIDEND_TTL = 6 * 3600
 
 # 抓一包資料最多等幾秒（整包，不是每次讀取）。
 _DEADLINE = 8
+# 過期多久以內的舊資料還可以先拿來回（同時背景重抓）。超過就當場抓。
+_MAX_STALE = 86400
 # 抓失敗之後多久內不再試。webhook 只有 5 秒，不能每一則訊息都去等一次逾時。
 _RETRY_AFTER = 30
 
@@ -88,45 +90,82 @@ def _with_deadline(load, seconds: float):
 
 
 def _cached(key: tuple, ttl: float, load):
-    """key 對應的資料；過期就用 load() 重抓，重抓失敗就繼續用舊的。"""
+    """key 對應的資料。
+
+        還新鮮          直接回
+        過期、不到一天  **先回舊的**，背景重抓——使用者不必替快取過期付等待時間
+        沒有、或太舊    當場抓，抓到才回
+    """
     hit = _cache.get(key)
-    if hit and time.time() - hit[0] < ttl:
-        return hit[1]
-    with _locks_guard:
-        lock = _locks.setdefault(key, threading.Lock())
+    if hit:
+        age = time.time() - hit[0]
+        if age < ttl:
+            return hit[1]
+        if age < _MAX_STALE:
+            _refresh_in_background(key, load)
+            return hit[1]
+    lock = _lock_for(key)
     # 等鎖也有期限：前一個人最多抓 _DEADLINE 秒，再多就是出事了。
     if not lock.acquire(timeout=_DEADLINE + 2):
         if hit:
             return hit[1]
         raise TimeoutError(f"{key} 等不到前一次抓取結束")
     try:
-        hit = _cache.get(key)
-        if hit and time.time() - hit[0] < ttl:
-            return hit[1]
-        failed = _failed.get(key)
-        if failed and time.time() - failed[0] < _RETRY_AFTER:
-            if hit:
-                return hit[1]
-            raise failed[1]
-        started = time.perf_counter()
-        try:
-            value = _with_deadline(load, _DEADLINE)
-        except Exception as exc:  # noqa: BLE001 - 見開頭「舊資料繼續用」
-            _failed[key] = (time.time(), exc)
-            print(f"[source] {key} 失敗（{time.perf_counter() - started:.1f} s）："
-                  f"{type(exc).__name__}: {exc}"[:300], flush=True)
-            if hit:
-                return hit[1]
-            raise
-        took = time.perf_counter() - started
-        if took > 2:
-            # 平常每一支都在 1 秒內。慢的要看得見——那是逾時的前兆。
-            print(f"[source] {key} 抓了 {took:.1f} s", flush=True)
-        _failed.pop(key, None)
-        _cache[key] = (time.time(), value)
-        return value
+        fresh = _cache.get(key)
+        if fresh and time.time() - fresh[0] < ttl:
+            return fresh[1]
+        return _load_locked(key, load, hit)
     finally:
         lock.release()
+
+
+def _lock_for(key: tuple) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(key, threading.Lock())
+
+
+def _load_locked(key: tuple, load, hit):
+    """真的去抓。呼叫的人要先拿到這個 key 的鎖。失敗時有舊資料就回舊的。"""
+    failed = _failed.get(key)
+    if failed and time.time() - failed[0] < _RETRY_AFTER:
+        if hit:
+            return hit[1]
+        raise failed[1]
+    started = time.perf_counter()
+    try:
+        value = _with_deadline(load, _DEADLINE)
+    except Exception as exc:  # noqa: BLE001 - 見開頭「舊資料繼續用」
+        _failed[key] = (time.time(), exc)
+        print(f"[source] {key} 失敗（{time.perf_counter() - started:.1f} s）："
+              f"{type(exc).__name__}: {exc}"[:300], flush=True)
+        if hit:
+            return hit[1]
+        raise
+    took = time.perf_counter() - started
+    if took > 2:
+        # 平常每一支都在 1 秒內。慢的要看得見——那是逾時的前兆。
+        print(f"[source] {key} 抓了 {took:.1f} s", flush=True)
+    _failed.pop(key, None)
+    _cache[key] = (time.time(), value)
+    return value
+
+
+def _refresh_in_background(key: tuple, load) -> None:
+    """過期的資料在背景重抓。已經有人在抓就不重複。"""
+    lock = _lock_for(key)
+    if not lock.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            _load_locked(key, load, _cache.get(key))
+        except Exception:  # noqa: BLE001 - 失敗已經在 _load_locked 印過
+            pass
+        finally:
+            lock.release()
+
+    # 鎖在這條執行緒拿、在那條放——threading.Lock 允許，RLock 不行。
+    threading.Thread(target=run, name="source-refresh", daemon=True).start()
 
 
 def _get_json(url: str, **params):

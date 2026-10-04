@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import date
 
 from dotenv import load_dotenv
 
@@ -30,7 +31,9 @@ app = Flask(__name__)
 # LINE 沒設定時整包停用，而「停用」在外面看起來跟「正常」一樣安靜，
 # 所以啟動時講清楚現在是哪一種。
 if line_client.enabled():
-    print("[info] LINE bot 已啟用", flush=True)
+    # 印 pid 是為了跟 gunicorn 的「Booting worker with pid」比：一樣就是 worker
+    # 自己載入的，不一樣就是主行程載入後才 fork（見 _start_warm_up 的說明）。
+    print(f"[info] LINE bot 已啟用（載入於 pid {os.getpid()}）", flush=True)
 else:
     print(
         "[warn] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 未設定，"
@@ -48,16 +51,27 @@ def _warm_up() -> None:
 
     抓失敗沒關係，真的有人問的時候會再抓一次。
     """
-    for load in (sources.twse_quotes, sources.tpex_quotes,
-                 sources.twse_yields, sources.tpex_yields):
+    year = date.today().year
+    loads = [
+        ("twse_quotes", sources.twse_quotes), ("tpex_quotes", sources.tpex_quotes),
+        ("twse_yields", sources.twse_yields), ("tpex_yields", sources.tpex_yields),
+        # 配息公告：第一次問「利率」「配息」要用到今年與去年兩份，各要下載並解析
+        # 一張六百 KB 的網頁表格。在 Render 的 0.1 顆 CPU 上那是三到五秒——
+        # 2026-10-04 實測，沒預抓時第一次問上櫃股票的利率花了 5.2 秒。
+        *((f"mops_{m}_{y}", lambda m=m, y=y: sources.mops_dividends(m, y))
+          for m in ("tse", "otc") for y in (year, year - 1)),
+        ("tpex_past_dividends", lambda: sources.tpex_past_dividends(date.today())),
+        ("tpex_upcoming_dividends", sources.tpex_upcoming_dividends),
+    ]
+    for name, load in loads:
         started = time.perf_counter()
         try:
             n = len(load())
             # 每一支都印：這台主機連不連得到資料來源，開機 log 就看得出來。
-            print(f"[warm] {load.__name__} {n} 筆，{time.perf_counter() - started:.1f} s",
+            print(f"[warm] {name} {n} 筆，{time.perf_counter() - started:.1f} s",
                   flush=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"[warn] 預抓 {load.__name__} 失敗（{time.perf_counter() - started:.1f} s）："
+            print(f"[warn] 預抓 {name} 失敗（{time.perf_counter() - started:.1f} s）："
                   f"{type(exc).__name__}: {exc}"[:300], flush=True)
 
 
@@ -69,13 +83,16 @@ def _start_warm_up():
     """第一個請求進來時才啟動預抓（保活的 /health 也算）。
 
     ★ **不能在 import 的時候就開執行緒**。2026-10-04 上線第一天就是這樣壞的：
-      Render 上 gunicorn 是先在主行程載入這個檔、再 fork 出 worker（log 裡
-      「LINE bot 已啟用」印在「Booting worker」之前）。fork 只複製呼叫它的那條
-      執行緒，但會把**當下被別條執行緒握著的鎖**原樣複製過去——預抓那條執行緒
-      正在連線，握著的鎖到了 worker 裡就再也沒有人會放。結果是 worker 裡每一次
-      對外連線都永遠卡住，連 requests 的 timeout 都不會觸發：回覆 LINE、查股價、
-      畫圖全部沒有反應，只有不對外連線的 /health 正常。本機不會 fork 在載入
-      之後，所以完全測不出來。
+      在模組層開執行緒去預抓時，Render 上 worker 裡每一次對外連線都永遠卡住，
+      連 requests 的 timeout 都不會觸發——回覆 LINE、查股價、畫圖全部沒有
+      反應，只有不對外連線的 /health 正常。本機完全測不出來。改成這裡之後
+      當場就好了（實測 webhook 0.6 秒）。
+
+      **為什麼**會卡，沒有查到底。當時的推論是 gunicorn 先在主行程載入再 fork，
+      預抓那條執行緒握著的鎖被複製進 worker 後沒有人放。但依據只有 log 的
+      先後順序，而 stdout 與 stderr 在 Render 上是合併顯示的，順序不可靠；
+      boo-king-king 在同一個平台上有相反的證據（每個 worker 各自載入）。
+      要確認就比對開機那行印的 pid 與「Booting worker with pid」。
 
       規則：這個檔在載入階段不啟動任何執行緒、不對外連線。
     """
