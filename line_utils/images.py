@@ -18,10 +18,10 @@ LINE 的圖片訊息**只收網址**（HTTPS），不收檔案本身。所以 bo
 給個代號就替他去打六次證交所」的公開代理——證交所會擋打太兇的 IP，被擋了
 整個 bot 就查不到股價。只有 bot 自己回出去的網址畫得出圖。
 
-## 同一支股票一天只畫一次
+## 同一支股票一小時只畫一次
 
 LINE 的預覽圖與原圖是同一個網址，會抓兩次；群組裡每個人的裝置也各抓一次。
-每月均價一天只變一次，所以畫好的圖照「代號＋日期」放在記憶體裡。
+所以畫好的圖照「代號＋日期＋幾點」放在記憶體裡，跟資料的快取同樣是一小時。
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def render(spec: str) -> bytes | None:
     if sym is None:
         return None
     now = market.now()
-    key = (sym.code, now.date())
+    key = (sym.code, now.date(), now.hour)
     png = _drawn.get(key)
     if png is not None:
         return png
@@ -138,16 +138,12 @@ def render(spec: str) -> bytes | None:
                 flush=True,
             )
             with _guard:
-                # 換日之後昨天的圖與鎖都用不到了，順手清掉。
-                for old in [k for k in _drawn if k[1] != now.date()]:
+                # 過了這個小時的圖與鎖都用不到了，順手清掉。
+                for old in [k for k in _drawn if k[1:] != key[1:]]:
                     del _drawn[old]
-                for old in [k for k in _drawing if k[1] != now.date()]:
+                for old in [k for k in _drawing if k[1:] != key[1:]]:
                     del _drawing[old]
-                # ★ 中間缺月份的圖不留：那是某一年沒抓到，留下來的話今天之後
-                #   每個人看到的都是這張缺一截的圖。下一次來抓就會重畫。
-                known = [m[2] is not None for m in months[:-1]]
-                if all(known[known.index(True):] if True in known else []):
-                    _drawn[key] = png
+                _drawn[key] = png
         return png
     finally:
         lock.release()

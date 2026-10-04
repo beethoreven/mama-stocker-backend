@@ -27,7 +27,6 @@ class Symbol:
     code: str
     name: str
     market: str            # 'tse' 上市、'otc' 上櫃
-    close: float | None    # 最近一個交易日的收盤價
 
     @property
     def is_etf(self) -> bool:
@@ -36,7 +35,7 @@ class Symbol:
 
 
 def _symbol(market: str, code: str, row: dict) -> Symbol:
-    return Symbol(code, row["name"], market, row["close"])
+    return Symbol(code, row["name"], market)
 
 
 def by_code(code: str) -> Symbol | None:
@@ -66,21 +65,19 @@ def price(sym: Symbol) -> tuple[bool, float | None]:
     盤中 = 現在是 9:00～13:30，而且行情資料的日期就是今天。假日與颱風假
     不必另外查行事曆：那種日子行情資料停在上一個交易日，日期對不上。
 
-    ★ 收盤後也是問即時行情那一支，不是每日收盤表：收盤表要到下午才更新，
-      13:30 剛收盤時那裡還是昨天的價。即時行情問不到才退回收盤表。
+    ★ 只問即時行情那一支，問不到就拋錯，**不退回每日收盤表**。收盤表要到
+      下午才更新：盤中或剛收盤時拿它的數字，會把昨天的收盤價當成「當前」
+      回出去。案主 2026-10-04：可以等、可以查不到，但數字要對。
     """
-    try:
-        rt = sources.realtime(sym.market, sym.code)
-    except Exception:  # noqa: BLE001 - 行情網站不通時還有收盤表可用
-        rt = None
+    rt = sources.realtime(sym.market, sym.code)
     if not rt:
-        return False, sym.close
+        raise LookupError(f"即時行情沒有 {sym.code} 的資料")
     t = now()
     if rt["date"] == t.date() and _OPEN <= t.time() < _CLOSE:
         # 盤中某一瞬間可能剛好沒有成交，那時用前一筆。
         return True, rt["last"] or rt["prev_trade"] or rt["prev_close"]
     # 收盤後 last 就是收盤價；開盤前還沒有成交，昨收就是「當前收盤價」。
-    return False, rt["last"] or rt["prev_close"] or sym.close
+    return False, rt["last"] or rt["prev_close"]
 
 
 # ── 配息 ─────────────────────────────────────────────────────────
@@ -121,10 +118,7 @@ def _tpex_etf_payouts(code: str, today: date) -> list[Payout]:
              for r in sources.tpex_past_dividends(today).get(code, [])}
     for r in sources.tpex_upcoming_dividends().get(code, []):
         by_ex.setdefault(r["ex_date"], r["cash"])
-    try:
-        pay_dates = sources.tpex_etf_pay_dates(code)
-    except Exception:  # noqa: BLE001 - 少了發放日還是答得出金額與除息日
-        pay_dates = {}
+    pay_dates = sources.tpex_etf_pay_dates(code)
     gap = None
     if pay_dates:
         last_ex = max(pay_dates)
@@ -241,26 +235,20 @@ _MONTHLY_DEADLINE = 10
 
 
 def _monthly_many(market: str, code: str, years: list[int]) -> dict[int, dict[int, float]]:
-    """同時問好幾年。**到時間就不等了**，沒回來的那幾年當作沒有資料。
+    """同時問好幾年。**到時間就不等了**，而且只要有一年沒問到就整個失敗。
+
+    ★ 不能把沒問到的那一年當成「沒有資料」：圖上沒有資料的月份會被畫成
+      「尚未上市」，那等於把連線失敗畫成一個錯的事實。寧可這張圖出不來。
 
     ★ 不能用 `with ThreadPoolExecutor()`：它離開時會等每一支都結束，其中一支
-      不回來就整個請求陪它等。2026-10-04 在 Render 上第一次畫圖就掛了五十分鐘
-      （本機 1 秒），後面每一張圖都跟著排隊。當時沒有 log，卡在哪一支是推測；
-      requests 的 timeout 只管「多久沒收到任何東西」，對方慢慢吐資料時不會觸發。
+      不回來就整個請求陪它等。
     """
     pool = ThreadPoolExecutor(len(years))
-    futures = {pool.submit(_monthly, market, code, y): y for y in years}
+    futures = {pool.submit(sources.monthly_prices, market, code, y): y for y in years}
     done, late = wait(futures, timeout=_MONTHLY_DEADLINE)
     pool.shutdown(wait=False, cancel_futures=True)
     if late:
-        print(f"[trend] {code} {market} 有 {len(late)} 年超過 {_MONTHLY_DEADLINE} 秒沒回來："
-              f"{sorted(futures[f] for f in late)}", flush=True)
+        raise TimeoutError(
+            f"{code} {market} 有 {len(late)} 年超過 {_MONTHLY_DEADLINE} 秒沒回來："
+            f"{sorted(futures[f] for f in late)}")
     return {futures[f]: f.result() for f in done}
-
-
-def _monthly(market: str, code: str, year: int) -> dict[int, float]:
-    try:
-        return sources.monthly_prices(market, code, year)
-    except Exception as exc:  # noqa: BLE001 - 少一年就畫少一年，不要整張圖沒了
-        print(f"[trend] {code} {market} {year} 抓不到：{type(exc).__name__}: {exc}"[:300], flush=True)
-        return {}
