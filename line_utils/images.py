@@ -96,26 +96,58 @@ def verify(token: str, secret: str) -> str | None:
 # ── 來抓的時候 ───────────────────────────────────────────────────
 
 _drawn: dict[tuple, bytes] = {}
-_drawn_lock = threading.Lock()
+_drawing: dict[tuple, threading.Lock] = {}
+_guard = threading.Lock()
+
+# 同一張圖已經有人在畫時，後到的最多等幾秒。
+_WAIT_SECONDS = 25
 
 
 def render(spec: str) -> bytes | None:
-    """spec → PNG。代號查不到就回 None。"""
+    """spec → PNG。代號查不到、或等太久，就回 None。"""
     sym = market.by_code(spec[1:])
     if sym is None:
         return None
     now = market.now()
     key = (sym.code, now.date())
-    # ★ 整段鎖起來：預覽圖與原圖幾乎同時來抓，不鎖的話兩邊各打六次證交所。
-    with _drawn_lock:
+    png = _drawn.get(key)
+    if png is not None:
+        return png
+    # ★ 一張圖一把鎖：預覽圖與原圖幾乎同時來抓，不鎖的話兩邊各打六次證交所。
+    #   不能所有圖共用一把——某一支股票卡住時，別支股票的圖不該跟著排隊。
+    #   等也要有期限：拿不到鎖就放棄，不要把處理請求的執行緒一個個佔滿。
+    with _guard:
+        lock = _drawing.setdefault(key, threading.Lock())
+    if not lock.acquire(timeout=_WAIT_SECONDS):
+        print(f"[trend] {sym.code} 等了 {_WAIT_SECONDS} 秒還在畫，放棄", flush=True)
+        return None
+    try:
         png = _drawn.get(key)
         if png is None:
+            started = time.perf_counter()
+            months = market.five_year_monthly(sym)
+            fetched = time.perf_counter()
             # 在這裡才 import：Pillow 只有畫圖用得到，問股價的請求不必載它。
             from line_utils import draw
 
-            png = draw.trend_png(sym.name, sym.code, market.five_year_monthly(sym), now=now)
-            # 換日之後昨天的圖都用不到了，順手清掉。
-            for old in [k for k in _drawn if k[1] != now.date()]:
-                del _drawn[old]
-            _drawn[key] = png
+            png = draw.trend_png(sym.name, sym.code, months, now=now)
+            print(
+                f"[trend] {sym.code} 查資料 {fetched - started:.1f} s"
+                f"（{sum(1 for m in months if m[2] is not None)}/60 個月有資料）"
+                f"｜畫圖 {time.perf_counter() - fetched:.1f} s",
+                flush=True,
+            )
+            with _guard:
+                # 換日之後昨天的圖與鎖都用不到了，順手清掉。
+                for old in [k for k in _drawn if k[1] != now.date()]:
+                    del _drawn[old]
+                for old in [k for k in _drawing if k[1] != now.date()]:
+                    del _drawing[old]
+                # ★ 中間缺月份的圖不留：那是某一年沒抓到，留下來的話今天之後
+                #   每個人看到的都是這張缺一截的圖。下一次來抓就會重畫。
+                known = [m[2] is not None for m in months[:-1]]
+                if all(known[known.index(True):] if True in known else []):
+                    _drawn[key] = png
         return png
+    finally:
+        lock.release()

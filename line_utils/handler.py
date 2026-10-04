@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from db import users
 from line_utils import commands
 from line_utils.images import ImageReply
 from stock_utils import market
@@ -50,7 +51,14 @@ def text_to_me(event: dict) -> str | None:
     return None
 
 
-def handle_command(text: str) -> str | ImageReply:
+def is_my_id(event: dict, text: str) -> bool:
+    """私訊問「我的ID」。只在私訊回：群組裡回的話，那串 id 整個群組都看得到。"""
+    if (event.get("source") or {}).get("type") != "user":
+        return False
+    return text.replace(" ", "").upper() in ("我的ID", "MYID")
+
+
+def handle_command(text: str, *, sender: str | None) -> str | ImageReply:
     """處理一段已經清乾淨的指令文字，回傳要回覆的東西。
 
     多半是幾行字；走勢回的是 ImageReply，由 app.py 換成圖片訊息——網址要在
@@ -59,6 +67,12 @@ def handle_command(text: str) -> str | ImageReply:
     ★ 不論看不看得懂都回一句——傳了訊息卻沒有任何反應，使用者無從判斷是
       「格式錯」還是「bot 死了」。資料來源掛掉時也一樣要回。
     """
+    # ★ 權限排在**所有判斷之前**（同 boo-king-king）。沒開通的人不管傳什麼
+    #   都回同一句，連格式列表都不給——這個 bot 只給綁定過的人用（案主
+    #   2026-10-04）。
+    if not users.is_allowed(sender):
+        return commands.NO_PERMISSION
+
     kind, payload = commands.parse(text)
     if kind == commands.UNKNOWN:
         return commands.USAGE

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import calendar
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from statistics import median
@@ -224,13 +224,11 @@ def five_year_monthly(sym: Symbol) -> list[tuple[int, int, float | None]]:
     years = list(range(today.year - 5, today.year + 1))
     # ★ 六年一起問，不要一年一年排隊：證交所一支要 0.7 秒左右，排隊就是四五秒，
     #   而這段時間 LINE 正等著抓圖。實測六支同時打約 1 秒，沒有被擋。
-    with ThreadPoolExecutor(len(years)) as pool:
-        by_year = dict(zip(years, pool.map(
-            lambda y: _monthly(sym.market, sym.code, y), years)))
-        # 這幾年內從上櫃轉上市（或反過來）的股票，轉之前的資料在另一邊。
-        empty = [y for y in years if not by_year[y]]
-        by_year.update(zip(empty, pool.map(
-            lambda y: _monthly(other, sym.code, y), empty)))
+    by_year = _monthly_many(sym.market, sym.code, years)
+    # 這幾年內從上櫃轉上市（或反過來）的股票，轉之前的資料在另一邊。
+    empty = [y for y in years if not by_year.get(y)]
+    if empty:
+        by_year.update(_monthly_many(other, sym.code, empty))
     out = []
     for i in range(59, -1, -1):
         y, m = divmod(today.year * 12 + today.month - 1 - i, 12)
@@ -238,8 +236,31 @@ def five_year_monthly(sym: Symbol) -> list[tuple[int, int, float | None]]:
     return out
 
 
+# 一批每月均價最多等幾秒。
+_MONTHLY_DEADLINE = 10
+
+
+def _monthly_many(market: str, code: str, years: list[int]) -> dict[int, dict[int, float]]:
+    """同時問好幾年。**到時間就不等了**，沒回來的那幾年當作沒有資料。
+
+    ★ 不能用 `with ThreadPoolExecutor()`：它離開時會等每一支都結束，其中一支
+      不回來就整個請求陪它等。2026-10-04 在 Render 上第一次畫圖就掛了五十分鐘
+      （本機 1 秒），後面每一張圖都跟著排隊。當時沒有 log，卡在哪一支是推測；
+      requests 的 timeout 只管「多久沒收到任何東西」，對方慢慢吐資料時不會觸發。
+    """
+    pool = ThreadPoolExecutor(len(years))
+    futures = {pool.submit(_monthly, market, code, y): y for y in years}
+    done, late = wait(futures, timeout=_MONTHLY_DEADLINE)
+    pool.shutdown(wait=False, cancel_futures=True)
+    if late:
+        print(f"[trend] {code} {market} 有 {len(late)} 年超過 {_MONTHLY_DEADLINE} 秒沒回來："
+              f"{sorted(futures[f] for f in late)}", flush=True)
+    return {futures[f]: f.result() for f in done}
+
+
 def _monthly(market: str, code: str, year: int) -> dict[int, float]:
     try:
         return sources.monthly_prices(market, code, year)
-    except Exception:  # noqa: BLE001 - 少一年就畫少一年，不要整張圖沒了
+    except Exception as exc:  # noqa: BLE001 - 少一年就畫少一年，不要整張圖沒了
+        print(f"[trend] {code} {market} {year} 抓不到：{type(exc).__name__}: {exc}"[:300], flush=True)
         return {}

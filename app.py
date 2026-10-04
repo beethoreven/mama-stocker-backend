@@ -22,6 +22,7 @@ from line_utils import client as line_client  # noqa: E402
 from line_utils import handler as line_handler  # noqa: E402
 from line_utils import images as line_images  # noqa: E402
 from line_utils import signature as line_signature  # noqa: E402
+from db import connection as db_connection  # noqa: E402
 from stock_utils import sources  # noqa: E402
 
 app = Flask(__name__)
@@ -36,6 +37,10 @@ else:
         "LINE bot 停用——webhook 會回 503。",
         flush=True,
     )
+
+# 沒有資料庫就查不到誰有權限，等於沒有人能用——這也要講清楚。
+if not db_connection.enabled():
+    print("[warn] DATABASE_URL 未設定：查不到使用者名單，所有人都會被當成沒有權限。", flush=True)
 
 
 def _warm_up() -> None:
@@ -104,8 +109,20 @@ def _handle_line_event(event: dict) -> None:
         # 訊息都跟 bot 無關，每一則都留一筆 log 只會把真的錯誤淹掉。
         return
     reply_token = event.get("replyToken")
-    if reply_token:
-        line_client.reply(reply_token, _line_messages(line_handler.handle_command(text)))
+    if not reply_token:
+        return
+    sender = (event.get("source") or {}).get("userId")
+
+    # 拿自己的 userId。開通要先有這個 id，而它只有在對方跟 bot 有互動之後才
+    # 拿得到。任何人都能問——回的是「你自己的 id」，不是誰的秘密。
+    if line_handler.is_my_id(event, text):
+        if sender:
+            line_client.reply(reply_token, f"你的 LINE userId：\n{sender}")
+        return
+
+    line_client.reply(
+        reply_token, _line_messages(line_handler.handle_command(text, sender=sender))
+    )
 
 
 def _line_messages(reply):

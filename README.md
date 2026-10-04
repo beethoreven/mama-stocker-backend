@@ -1,7 +1,8 @@
 # mama-stocker-backend
 
 LINE bot：傳股票名稱或代號給它，回股價、配息、五年走勢圖。
-資料全部來自證交所、櫃買中心、公開資訊觀測站的公開端點，不需要金鑰，也沒有資料庫。
+股票資料全部來自證交所、櫃買中心、公開資訊觀測站的公開端點，不需要金鑰。
+資料庫只存一張表：誰可以用這個 bot。
 
 ## 指令
 
@@ -15,12 +16,14 @@ LINE bot：傳股票名稱或代號給它，回股價、配息、五年走勢圖
 
 名稱要完全符合。私訊直接傳；群組裡要 tag bot。看不懂的一律回格式列表。
 
+**只有開通過的 LINE 帳號能用**，其他人不管傳什麼都回「這個帳號沒有使用權限」。
+
 ## 本機啟動
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env    # 填 LINE 的兩個憑證
+cp .env.example .env    # 填 LINE 的兩個憑證與 DATABASE_URL
 ./venv/bin/python app.py
 ```
 
@@ -34,6 +37,28 @@ gunicorn app:app --workers 1 --threads 8
 
 ★ **一定要單一 worker**。快取與畫好的走勢圖都放在記憶體裡，多個 worker 各有
 一份，等於每個 worker 都各自去打一次證交所。
+
+## 開通使用者
+
+誰能用記在資料庫的 `users` 表（開機後第一次查詢時自動建立），沒有介面，用 SQL 管。
+
+1. 請對方加 bot 好友，**私訊**傳 `我的ID`，bot 會回一串 `U` 開頭的 userId。
+   這一步任何人都能做，回的是他自己的 id。
+2. 在資料庫執行：
+
+   ```sql
+   INSERT INTO users (name, line_user_id) VALUES ('媽媽', 'Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
+   ```
+
+3. 最慢一分鐘後生效（名單有快取）。
+
+停用：`UPDATE users SET status = 'disabled' WHERE name = '媽媽';`
+
+★ 這串 userId 不是使用者自己設定的那個 LINE ID，而且**每個 Provider 各自一套**：
+同一個人在別的 Provider 的官方帳號底下是另一串，不能從別的專案抄過來，
+要在這個 bot 上問 `我的ID` 才準。
+
+★ `DATABASE_URL` 沒設、或資料庫連不上又沒有舊名單時，所有人都會被擋。
 
 ## LINE 那邊要設定的東西
 
@@ -69,6 +94,7 @@ gunicorn app:app --workers 1 --threads 8
 | 看到什麼 | 代表 |
 |---|---|
 | 開機那行是「LINE bot 停用」 | 兩個環境變數沒設好 |
+| 每個人都回「沒有使用權限」 | `DATABASE_URL` 沒設（開機會印警告）、連不上，或那個人還沒開通 |
 | 完全沒有 `/line/webhook` 的請求 | LINE 沒送過來：Webhook URL 填錯，或 Use webhook 沒開 |
 | `/line/webhook` 回 401 | Channel secret 填錯（或填成別的 channel 的） |
 | 回 200 但沒收到回覆，log 有「LINE reply 失敗 401」 | Channel access token 填錯 |
@@ -89,6 +115,10 @@ line_utils/
   handler.py        指令 → 回覆的那幾行字
   images.py         走勢圖的簽名網址與快取
   draw.py           用 Pillow 畫折線圖
+db/
+  connection.py     每次請求各開一條連線（不用連線池，理由見檔案開頭）
+  schema.py         users 表
+  users.py          這個 LINE 帳號能不能用（含一分鐘快取）
 stock_utils/
   sources.py        一支函式對一個公開端點（含快取）
   market.py         把端點資料拼成股價、配息、殖利率、五年走勢
