@@ -90,8 +90,9 @@ def _answer(kind: str, payload: dict) -> str | ImageReply:
     else:
         sym = market.by_code(wanted["code"])
     if sym is None:
-        asked = wanted.get("name") or wanted.get("code")
-        return f"找不到「{asked}」這支股票。\n\n{commands.USAGE}"
+        # 找不到就直接回格式說明，前面不加「找不到『xx』這支股票」那一句——
+        # 這是給長輩看的，多一句只是多一件要讀的事（案主 2026-10-04）。
+        return commands.USAGE
 
     if kind == commands.BAD_DIVIDEND:
         return commands.DIVIDEND_USAGE
