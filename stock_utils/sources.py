@@ -18,6 +18,16 @@ webhook 有 5 秒的預算，而這裡每一支實測都在 1 秒內；app.py �
 
 ★ 抓失敗時**舊資料繼續用**，不把例外往外拋——證交所偶爾會擋連線，
   回昨天的數字比回「查不到」有用。從來沒抓成功過才會拋。
+
+## 每一次抓資料都有總期限
+
+★ requests 的 timeout 不是總期限，它只管「多久沒收到任何東西」。對方慢慢吐
+  資料時它永遠不會觸發。2026-10-04 部署到 Render 後就是這樣：某一支在開機
+  預抓時卡住不回來，握著那份資料的鎖；之後每個請求都排在那把鎖後面，八條
+  執行緒全部佔滿，連 /health 都不回應，只能重新部署。
+
+  所以這裡有三道：下載放到另一條執行緒、等不到就放棄（_DEADLINE）；等鎖也有
+  期限；剛失敗過的短時間內直接回失敗，不要每個請求都再等一次。
 """
 
 from __future__ import annotations
@@ -34,16 +44,47 @@ import requests
 log = logging.getLogger(__name__)
 
 _UA = {"User-Agent": "Mozilla/5.0 (mama-stocker)"}
-_TIMEOUT = 8
+# 連線 4 秒、每次讀取 6 秒。這不是總期限，總期限見 _DEADLINE。
+_TIMEOUT = (4, 6)
 
 # 全市場的每日資料放多久。收盤後幾點更新各端點不一樣，一小時夠新了。
 _DAILY_TTL = 3600
 # 配息公告放多久。公告隨時可能出來，但不差這幾小時。
 _DIVIDEND_TTL = 6 * 3600
 
+# 抓一包資料最多等幾秒（整包，不是每次讀取）。
+_DEADLINE = 8
+# 抓失敗之後多久內不再試。webhook 只有 5 秒，不能每一則訊息都去等一次逾時。
+_RETRY_AFTER = 30
+
 _cache: dict[tuple, tuple[float, object]] = {}
+_failed: dict[tuple, tuple[float, Exception]] = {}
 _locks: dict[tuple, threading.Lock] = {}
 _locks_guard = threading.Lock()
+
+
+def _with_deadline(load, seconds: float):
+    """在另一條執行緒跑 load()，超過 seconds 就不等了。
+
+    放棄的那條執行緒還會在背景跑到自己結束（Python 沒辦法從外面殺執行緒），
+    但它是 daemon，而且不握任何鎖——卡著的只有它自己。
+    """
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = load()
+        except Exception as exc:  # noqa: BLE001 - 帶回主執行緒再拋
+            box["error"] = exc
+
+    t = threading.Thread(target=run, name="source-load", daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"超過 {seconds:g} 秒沒有抓完")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def _cached(key: tuple, ttl: float, load):
@@ -53,19 +94,39 @@ def _cached(key: tuple, ttl: float, load):
         return hit[1]
     with _locks_guard:
         lock = _locks.setdefault(key, threading.Lock())
-    with lock:
+    # 等鎖也有期限：前一個人最多抓 _DEADLINE 秒，再多就是出事了。
+    if not lock.acquire(timeout=_DEADLINE + 2):
+        if hit:
+            return hit[1]
+        raise TimeoutError(f"{key} 等不到前一次抓取結束")
+    try:
         hit = _cache.get(key)
         if hit and time.time() - hit[0] < ttl:
             return hit[1]
-        try:
-            value = load()
-        except Exception as exc:  # noqa: BLE001 - 見開頭「舊資料繼續用」
+        failed = _failed.get(key)
+        if failed and time.time() - failed[0] < _RETRY_AFTER:
             if hit:
-                log.warning("重抓 %s 失敗，沿用舊資料：%s", key, exc)
+                return hit[1]
+            raise failed[1]
+        started = time.perf_counter()
+        try:
+            value = _with_deadline(load, _DEADLINE)
+        except Exception as exc:  # noqa: BLE001 - 見開頭「舊資料繼續用」
+            _failed[key] = (time.time(), exc)
+            print(f"[source] {key} 失敗（{time.perf_counter() - started:.1f} s）："
+                  f"{type(exc).__name__}: {exc}"[:300], flush=True)
+            if hit:
                 return hit[1]
             raise
+        took = time.perf_counter() - started
+        if took > 2:
+            # 平常每一支都在 1 秒內。慢的要看得見——那是逾時的前兆。
+            print(f"[source] {key} 抓了 {took:.1f} s", flush=True)
+        _failed.pop(key, None)
         _cache[key] = (time.time(), value)
         return value
+    finally:
+        lock.release()
 
 
 def _get_json(url: str, **params):
@@ -151,10 +212,11 @@ def realtime(market: str, code: str) -> dict | None:
         prev_trade  前一筆成交價
         prev_close  昨收
     """
-    data = _get_json(
+    # 不走 _cached，所以期限自己套。比別支短：問不到還有收盤表可以退。
+    data = _with_deadline(lambda: _get_json(
         "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
         ex_ch=f"{market}_{code}.tw", json=1, delay=0,
-    )
+    ), 3)
     rows = data.get("msgArray") or []
     if not rows:
         return None

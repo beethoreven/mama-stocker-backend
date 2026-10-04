@@ -44,20 +44,44 @@ if not db_connection.enabled():
 
 
 def _warm_up() -> None:
-    """開機時先把全市場的那幾包抓進快取，第一個使用者不必在 5 秒裡等它們。
+    """先把全市場的那幾包抓進快取，第一個問股價的人不必在 5 秒裡等它們。
 
-    放在模組層啟動而不是 __main__：正式環境用 gunicorn 啟動時不會執行
-    __main__。抓失敗沒關係，真的有人問的時候會再抓一次。
+    抓失敗沒關係，真的有人問的時候會再抓一次。
     """
     for load in (sources.twse_quotes, sources.tpex_quotes,
                  sources.twse_yields, sources.tpex_yields):
+        started = time.perf_counter()
         try:
-            load()
+            n = len(load())
+            # 每一支都印：這台主機連不連得到資料來源，開機 log 就看得出來。
+            print(f"[warm] {load.__name__} {n} 筆，{time.perf_counter() - started:.1f} s",
+                  flush=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"[warn] 預抓 {load.__name__} 失敗：{exc}", flush=True)
+            print(f"[warn] 預抓 {load.__name__} 失敗（{time.perf_counter() - started:.1f} s）："
+                  f"{type(exc).__name__}: {exc}"[:300], flush=True)
 
 
-threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
+_warm_started = threading.Event()
+
+
+@app.before_request
+def _start_warm_up():
+    """第一個請求進來時才啟動預抓（保活的 /health 也算）。
+
+    ★ **不能在 import 的時候就開執行緒**。2026-10-04 上線第一天就是這樣壞的：
+      Render 上 gunicorn 是先在主行程載入這個檔、再 fork 出 worker（log 裡
+      「LINE bot 已啟用」印在「Booting worker」之前）。fork 只複製呼叫它的那條
+      執行緒，但會把**當下被別條執行緒握著的鎖**原樣複製過去——預抓那條執行緒
+      正在連線，握著的鎖到了 worker 裡就再也沒有人會放。結果是 worker 裡每一次
+      對外連線都永遠卡住，連 requests 的 timeout 都不會觸發：回覆 LINE、查股價、
+      畫圖全部沒有反應，只有不對外連線的 /health 正常。本機不會 fork 在載入
+      之後，所以完全測不出來。
+
+      規則：這個檔在載入階段不啟動任何執行緒、不對外連線。
+    """
+    if not _warm_started.is_set():
+        _warm_started.set()
+        threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
 
 
 @app.get("/health")
