@@ -58,6 +58,8 @@ _RETRY_AFTER = 30
 _cache: dict[tuple, tuple[float, object]] = {}
 _failed: dict[tuple, tuple[float, Exception]] = {}
 _locks: dict[tuple, threading.Lock] = {}
+# 每一包最近一次抓取的結果，給 stats() 看。
+_last: dict[tuple, dict] = {}
 _locks_guard = threading.Lock()
 
 
@@ -137,6 +139,8 @@ def _cached(key: tuple, ttl: float, load, *, deadline: float | None = None):
             value = _with_deadline(load, deadline)
         except Exception as exc:  # noqa: BLE001 - 記下來再拋，見 _RETRY_AFTER
             _failed[key] = (time.time(), exc)
+            _last[key] = {"at": time.time(), "took": round(time.perf_counter() - started, 1),
+                          "error": f"{type(exc).__name__}: {exc}"[:200]}
             print(f"[source] {key} 失敗（{time.perf_counter() - started:.1f} s）："
                   f"{type(exc).__name__}: {exc}"[:300], flush=True)
             raise
@@ -146,9 +150,25 @@ def _cached(key: tuple, ttl: float, load, *, deadline: float | None = None):
             print(f"[source] {key} 抓了 {took:.1f} s", flush=True)
         _failed.pop(key, None)
         _cache[key] = (time.time(), value)
+        _last[key] = {"at": time.time(), "took": round(took, 1), "error": None}
         return value
     finally:
         lock.release()
+
+
+def stats() -> dict[str, dict]:
+    """每一包資料現在的狀態：幾秒前抓的、那次花多久、最近一次失敗是什麼。"""
+    now = time.time()
+    out = {}
+    for key in sorted(set(_cache) | set(_last), key=str):
+        last = _last.get(key, {})
+        out["/".join(str(k) for k in key)] = {
+            "cached_age": round(now - _cache[key][0]) if key in _cache else None,
+            "last_took": last.get("took"),
+            "last_error": last.get("error"),
+            "last_attempt_age": round(now - last["at"]) if last else None,
+        }
+    return out
 
 
 def _get_json(url: str, **params):

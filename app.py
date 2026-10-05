@@ -154,6 +154,24 @@ def line_webhook():
     # force：不看 Content-Type。簽章已經證明這包是 LINE 送的，沒有理由因為
     # 標頭寫法不同就把事件安靜地丟掉。
     body = request.get_json(force=True, silent=True) or {}
+
+    # 試跑：不回覆給 LINE，把「本來會回什麼」直接放在回應裡。
+    #
+    # 這條路是 2026-10-05 加的：線上回了錯的價格、又回「查不到」，而回覆只會
+    # 出現在使用者的手機上，從外面完全看不到它回了什麼、卡在哪一個資料來源。
+    # ★ 簽章已經在上面驗過——拿得出 channel secret 的人才走得到這裡，所以這
+    #   不是一個公開的查詢入口。
+    if request.headers.get("X-Dry-Run") == "1":
+        out = []
+        for event in body.get("events") or []:
+            started = time.perf_counter()
+            try:
+                replies = _handle_line_event(event, dry_run=True)
+            except Exception as exc:  # noqa: BLE001
+                replies = [f"{type(exc).__name__}: {exc}"]
+            out.append({"replies": replies, "seconds": round(time.perf_counter() - started, 1)})
+        return jsonify({"ok": True, "dry_run": out, "sources": sources.stats()})
+
     for event in body.get("events") or []:
         try:
             _handle_line_event(event)
@@ -162,34 +180,41 @@ def line_webhook():
     return jsonify({"ok": True})
 
 
-def _handle_line_event(event: dict) -> None:
-    try:
-        line_handler.note_group_member(event)
-    except Exception as exc:  # noqa: BLE001 - 記不到名單不該擋住回覆
-        app.logger.warning("記錄群組成員失敗：%s", exc)
+def _handle_line_event(event: dict, *, dry_run: bool = False) -> list:
+    """處理一則事件。回傳送出去（試跑時是本來會送出去）的訊息。"""
+    sent: list = []
+
+    def reply(message) -> None:
+        sent.append(message)
+        if not dry_run:
+            line_client.reply(reply_token, message)
+
+    if not dry_run:
+        try:
+            line_handler.note_group_member(event)
+        except Exception as exc:  # noqa: BLE001 - 記不到名單不該擋住回覆
+            app.logger.warning("記錄群組成員失敗：%s", exc)
 
     text = line_handler.text_to_me(event)
     if text is None:
         # 不是在跟我講話就完全不反應——不回覆、不記 log。群組裡大部分
         # 訊息都跟 bot 無關，每一則都留一筆 log 只會把真的錯誤淹掉。
-        return
+        return sent
     reply_token = event.get("replyToken")
     if not reply_token:
-        return
+        return sent
     sender = (event.get("source") or {}).get("userId")
 
     # 拿自己的 userId。開通要先有這個 id，而它只有在對方跟 bot 有互動之後才
     # 拿得到。任何人都能問——回的是「你自己的 id」，不是誰的秘密。
     if line_handler.is_my_id(event, text):
         if sender:
-            line_client.reply(reply_token, f"你的 LINE userId：\n{sender}")
-        return
+            reply(f"你的 LINE userId：\n{sender}")
+        return sent
 
     private = (event.get("source") or {}).get("type") == "user"
-    line_client.reply(
-        reply_token,
-        _line_messages(line_handler.handle_command(text, sender=sender, private=private)),
-    )
+    reply(_line_messages(line_handler.handle_command(text, sender=sender, private=private)))
+    return sent
 
 
 def _line_messages(reply):
