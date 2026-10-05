@@ -43,8 +43,8 @@ import requests
 log = logging.getLogger(__name__)
 
 _UA = {"User-Agent": "Mozilla/5.0 (mama-stocker)"}
-# 連線 4 秒、每次讀取 10 秒。這不是總期限，總期限見 _DEADLINE。
-_TIMEOUT = (4, 10)
+# 連線 4 秒、每次讀取 15 秒。這不是總期限，總期限見 _DEADLINE。
+_TIMEOUT = (4, 15)
 
 # 抓下來的資料放多久。這就是「回出去的數字最多落後官方多久」，不要為了快而
 # 調大。
@@ -222,7 +222,9 @@ def tpex_quotes() -> dict[str, dict]:
         return {r["SecuritiesCompanyCode"].strip():
                 {"name": r["CompanyName"].strip(), "close": number(r["Close"])}
                 for r in rows}
-    return _cached(("tpex_quotes",), _TTL, load)
+    # 這一包有 4.6 MB（連權證都在裡面），Render 上實測要 6～7 秒，貼著預設的
+    # 8 秒期限，所以給它寬一點。
+    return _cached(("tpex_quotes",), _TTL, load, deadline=25)
 
 
 # ── 全市場：官方殖利率（只有個股，ETF 不在裡面）─────────────────
@@ -326,11 +328,13 @@ def mops_dividends(market: str, year: int) -> dict[str, list[dict]]:
             raise ValueError("公開資訊觀測站的表格解不出任何一筆，版面可能改了")
         return out
     # 去年那一張已經不會再有新公告，放一天；今年的才需要跟著官方。
-    # ★ 這一支的期限比別人長。公開資訊觀測站上班時間很慢：2026-10-05 中午從
-    #   本機抓一張要 3～6 秒（前一晚是 0.8 秒），Render 上更久，8 秒的期限會
-    #   讓「利率」「配息」整個回「查不到」。平常是預抓在背景付這個時間。
+    # ★ 這一支的期限比別人長很多。公開資訊觀測站回得很慢，而且是對方慢、不是
+    #   解析慢（解析只要幾十毫秒）：2026-10-05 中午實測，同一張六百 KB 的表
+    #   本機要 3～6 秒，Render 上要 11～20 秒。8 秒的期限會讓「利率」「配息」
+    #   整個回「查不到」。平常是預抓在背景付這個時間，使用者不會等到。
+    #   （試過只查一家公司，網站不理 co_id，一律回整張表。）
     return _cached(("mops", market, year), _TTL if year >= date.today().year else 86400, load,
-                   deadline=20)
+                   deadline=45)
 
 
 # ── 配息：上市 ETF ───────────────────────────────────────────────
