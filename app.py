@@ -145,9 +145,9 @@ def line_webhook():
 
 def _handle_line_event(event: dict) -> None:
     try:
-        line_handler.note_group_speaker(event)
+        line_handler.note_group_member(event)
     except Exception as exc:  # noqa: BLE001 - 記不到名單不該擋住回覆
-        app.logger.warning("記錄群組發話者失敗：%s", exc)
+        app.logger.warning("記錄群組成員失敗：%s", exc)
 
     text = line_handler.text_to_me(event)
     if text is None:

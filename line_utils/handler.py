@@ -59,31 +59,46 @@ def is_my_id(event: dict, text: str) -> bool:
     return text.replace(" ", "").upper() in ("我的ID", "MYID")
 
 
-def note_group_speaker(event: dict) -> None:
-    """群組裡有人說話（不必 tag 我）：還沒開通的人，把他的 userId 記下來。
+def note_group_member(event: dict) -> None:
+    """群組裡有人說話（不必 tag 我）或有人加入：還沒開通的人，把 userId 記下來。
 
     之後已開通的人私訊「群組名單」就查得到，見 _group_list。
     每個人只在這個行程第一次看到時記一次——那一次會多打一支 LINE API 查名字、
     連一次資料庫；之後他說的每一句都是直接略過。
+
+        message       發話者在 source.userId（只有手機版發的訊息會附）
+        memberJoined  新成員在 joined.members[]，source 裡只有 groupId
     """
     source = event.get("source") or {}
-    uid = source.get("userId")
-    if event.get("type") != "message" or source.get("type") != "group" or not uid:
+    if source.get("type") != "group":
         return
-    if speakers.already_recorded(uid) or users.is_allowed(uid):
+    kind = event.get("type")
+    if kind == "message":
+        found = [(source.get("userId"), "message")]
+    elif kind == "memberJoined":
+        members = (event.get("joined") or {}).get("members") or []
+        found = [(m.get("userId"), "joined") for m in members if m.get("type") == "user"]
+    else:
         return
     group_id = source.get("groupId")
-    name = client.group_member_name(group_id, uid) if group_id else None
-    speakers.record(uid, group_id, name)
+    for uid, via in found:
+        if not uid or speakers.already_recorded(uid) or users.is_allowed(uid):
+            continue
+        name = client.group_member_name(group_id, uid) if group_id else None
+        speakers.record(uid, group_id, name, via)
 
 
 def _group_list() -> str:
     people = speakers.pending()
     if not people:
-        return "群組裡還沒有「說過話、但還沒開通」的人。\n請對方在群組裡隨便說一句話，再問我一次。"
-    lines = ["在群組說過話、還沒開通的人（最近說話的在前）："]
-    for name, uid in people:
-        lines += ["", name or "（查不到名字）", uid]
+        return ("群組裡還沒有「說過話或剛加入、但還沒開通」的人。\n"
+                "請對方用手機在群組裡隨便說一句話，再問我一次。")
+    lines = ["群組裡還沒開通的人（最近的在前）："]
+    for name, uid, via in people:
+        label = name or "（查不到名字）"
+        if via == "joined":
+            label += "（剛加入）"
+        lines += ["", label, uid]
     return "\n".join(lines)
 
 

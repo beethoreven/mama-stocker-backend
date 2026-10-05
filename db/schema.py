@@ -61,7 +61,15 @@ def _ensure_group_speakers(cur) -> None:
     訊息都會附上發話者的 userId。所以對方只要在群組說一句話，這裡就記得到，
     不必教他私訊「我的ID」——要開通的是長輩。
 
-    一個人一列（重複說話只更新時間）。已經開通的人不記，見 db/speakers.py。
+    另一個來源是「成員加入」事件：bot 已經在群組裡時，有人加入，LINE 會送
+    memberJoined，裡面帶新成員的 userId——那個人連話都不用說。
+
+    ★ 兩個來源各有抓不到的人（LINE 官方文件，2026-10-05 查）：
+        說話    只有手機版（iOS／Android）發的訊息會附 userId，電腦版發的不附
+        加入    只有 bot 進群**之後**才加入的人；原本就在的人沒有這個事件
+
+    一個人一列。via 記的是第一次看到他是哪一種。已經開通的人不記，
+    見 db/speakers.py。
     """
     cur.execute(
         """
@@ -72,4 +80,8 @@ def _ensure_group_speakers(cur) -> None:
             seen_at      TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
+    )
+    # 'message' 說過話、'joined' 剛加入。
+    cur.execute(
+        "ALTER TABLE group_speakers ADD COLUMN IF NOT EXISTS via TEXT NOT NULL DEFAULT 'message'"
     )

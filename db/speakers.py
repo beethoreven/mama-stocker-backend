@@ -1,4 +1,4 @@
-"""在群組裡說過話、還沒開通的人（為什麼要記，見 db/schema.py）。"""
+"""在群組裡說過話或剛加入、還沒開通的人（為什麼要記，見 db/schema.py）。"""
 
 from __future__ import annotations
 
@@ -14,26 +14,27 @@ def already_recorded(line_user_id: str) -> bool:
     return line_user_id in _recorded
 
 
-def record(line_user_id: str, group_id: str | None, name: str | None) -> None:
+def record(line_user_id: str, group_id: str | None, name: str | None, via: str) -> None:
+    """via 是 'message'（說了話）或 'joined'（剛加入）。"""
     with connection.pool.connection() as conn:
         with conn.cursor() as cur:
             ensure_once(cur)
             cur.execute(
                 """
-                INSERT INTO group_speakers (line_user_id, name, group_id)
-                VALUES (%s, %s, %s)
+                INSERT INTO group_speakers (line_user_id, name, group_id, via)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (line_user_id) DO UPDATE
                    SET name = COALESCE(EXCLUDED.name, group_speakers.name),
                        group_id = EXCLUDED.group_id,
                        seen_at = now()
                 """,
-                (line_user_id, name, group_id),
+                (line_user_id, name, group_id, via),
             )
     _recorded.add(line_user_id)
 
 
-def pending() -> list[tuple[str | None, str]]:
-    """還沒開通的人，[(顯示名稱, userId)]，最近說話的排前面。
+def pending() -> list[tuple[str | None, str, str]]:
+    """還沒開通的人，[(顯示名稱, userId, via)]，最近看到的排前面。
 
     ★ 「還沒開通」是查的時候才比對 users，不是記的時候：這樣開通之後那個人
       自然就從名單上消失，不必另外去刪。
@@ -43,7 +44,7 @@ def pending() -> list[tuple[str | None, str]]:
             ensure_once(cur)
             cur.execute(
                 """
-                SELECT s.name, s.line_user_id
+                SELECT s.name, s.line_user_id, s.via
                   FROM group_speakers s
                  WHERE NOT EXISTS (
                            SELECT 1 FROM users u WHERE u.line_user_id = s.line_user_id)
