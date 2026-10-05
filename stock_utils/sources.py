@@ -43,8 +43,8 @@ import requests
 log = logging.getLogger(__name__)
 
 _UA = {"User-Agent": "Mozilla/5.0 (mama-stocker)"}
-# 連線 4 秒、每次讀取 6 秒。這不是總期限，總期限見 _DEADLINE。
-_TIMEOUT = (4, 6)
+# 連線 4 秒、每次讀取 10 秒。這不是總期限，總期限見 _DEADLINE。
+_TIMEOUT = (4, 10)
 
 # 抓下來的資料放多久。這就是「回出去的數字最多落後官方多久」，不要為了快而
 # 調大。
@@ -85,7 +85,28 @@ def _with_deadline(load, seconds: float):
     return box["value"]
 
 
-def _cached(key: tuple, ttl: float, load):
+# 預抓的執行緒把這個設成 True：資料還剩不到 _REFRESH_AHEAD 秒就過期時，提前重抓。
+_ahead = threading.local()
+_REFRESH_AHEAD = 900
+
+
+class refresh_ahead:
+    """`with refresh_ahead():` 裡面的讀取會提前更新快過期的資料。
+
+    給 app.py 的預抓用：它每隔一陣子在背景把常用的那幾包重抓一次，使用者問的
+    時候資料永遠還在期限內，不必等。這**不是**回舊資料——回出去的東西一樣
+    不會超過 _TTL，只是重抓的那幾秒不落在使用者頭上。預抓沒跑到的時候
+    （剛開機、背景執行緒沒了），照樣是過期就當場抓。
+    """
+
+    def __enter__(self):
+        _ahead.on = True
+
+    def __exit__(self, *exc):
+        _ahead.on = False
+
+
+def _cached(key: tuple, ttl: float, load, *, deadline: float | None = None):
     """key 對應的資料：還在期限內就直接回，過期就當場重抓、抓到才回。
 
     ★ **過期的資料一律不回**，抓不到就拋錯（使用者會看到「現在查不到」）。
@@ -93,13 +114,16 @@ def _cached(key: tuple, ttl: float, load):
       重抓」與「抓失敗就沿用舊的」，都拿掉了——那兩種都會在使用者不知情的
       情況下給出舊數字。
     """
+    if getattr(_ahead, "on", False):
+        ttl = max(ttl - _REFRESH_AHEAD, 0)
+    deadline = deadline or _DEADLINE
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
     with _locks_guard:
         lock = _locks.setdefault(key, threading.Lock())
     # 等鎖也有期限：前一個人最多抓 _DEADLINE 秒，再多就是出事了。
-    if not lock.acquire(timeout=_DEADLINE + 2):
+    if not lock.acquire(timeout=deadline + 2):
         raise TimeoutError(f"{key} 等不到前一次抓取結束")
     try:
         hit = _cache.get(key)
@@ -110,7 +134,7 @@ def _cached(key: tuple, ttl: float, load):
             raise failed[1]
         started = time.perf_counter()
         try:
-            value = _with_deadline(load, _DEADLINE)
+            value = _with_deadline(load, deadline)
         except Exception as exc:  # noqa: BLE001 - 記下來再拋，見 _RETRY_AFTER
             _failed[key] = (time.time(), exc)
             print(f"[source] {key} 失敗（{time.perf_counter() - started:.1f} s）："
@@ -204,17 +228,32 @@ def tpex_yields() -> dict[str, float]:
 def realtime(market: str, code: str) -> dict | None:
     """證交所行情網站自己用的那一支。market 是 'tse' 或 'otc'。不快取。
 
-    回傳 {date, last, prev_trade, prev_close}：
+    回傳 {date, last, prev_close}：
         date        這筆資料是哪個交易日的（休市日會是上一個交易日）
-        last        最近成交價；當下那一瞬間沒有成交時是 None
-        prev_trade  前一筆成交價
+        last        今天最後一筆成交價；今天還沒有成交是 None
         prev_close  昨收
+
+    ★ **不能只看 z**。z 是「這一瞬間的快照剛好是一筆成交」才有值，盤中絕大多數
+      時候是 '-'（2026-10-05 開盤時實測：連續十幾次都是 '-'）。最後一筆成交在
+      trade 裡面：{"t": "11:48:45", "z": "2565.0000"}。第一版只看 z，z 是 '-'
+      就退回昨收，結果開盤第一天就把昨天的收盤價標成「盤中即時價」回出去。
+
+    ★ 同一個查詢字串，行情網站會回快取住的結果，實測可以到一分鐘左右沒變。
+      所以這裡的「即時」是一分鐘內，不是逐筆。
     """
-    # 不走 _cached，所以期限自己套。比別支短：問不到還有收盤表可以退。
-    data = _with_deadline(lambda: _get_json(
-        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-        ex_ch=f"{market}_{code}.tw", json=1, delay=0,
-    ), 3)
+    def load():
+        return _get_json(
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+            ex_ch=f"{market}_{code}.tw", json=1, delay=0,
+        )
+    # 不走 _cached，所以期限自己套。從 Render 連過去偶爾會慢，失敗就再試一次——
+    # 這一支問不到，使用者就只能看到「查不到」。
+    try:
+        data = _with_deadline(load, 4)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[source] 即時行情 {code} 第一次失敗，重試：{type(exc).__name__}: {exc}"[:200],
+              flush=True)
+        data = _with_deadline(load, 4)
     rows = data.get("msgArray") or []
     if not rows:
         return None
@@ -222,8 +261,7 @@ def realtime(market: str, code: str) -> dict | None:
     d = r.get("d") or ""
     return {
         "date": date(int(d[:4]), int(d[4:6]), int(d[6:8])) if len(d) == 8 else None,
-        "last": number(r.get("z")),
-        "prev_trade": number(r.get("pz")),
+        "last": number(r.get("z")) or number((r.get("trade") or {}).get("z")),
         "prev_close": number(r.get("y")),
     }
 
@@ -267,7 +305,12 @@ def mops_dividends(market: str, year: int) -> dict[str, list[dict]]:
         if not out and year < date.today().year:
             raise ValueError("公開資訊觀測站的表格解不出任何一筆，版面可能改了")
         return out
-    return _cached(("mops", market, year), _TTL, load)
+    # 去年那一張已經不會再有新公告，放一天；今年的才需要跟著官方。
+    # ★ 這一支的期限比別人長。公開資訊觀測站上班時間很慢：2026-10-05 中午從
+    #   本機抓一張要 3～6 秒（前一晚是 0.8 秒），Render 上更久，8 秒的期限會
+    #   讓「利率」「配息」整個回「查不到」。平常是預抓在背景付這個時間。
+    return _cached(("mops", market, year), _TTL if year >= date.today().year else 86400, load,
+                   deadline=20)
 
 
 # ── 配息：上市 ETF ───────────────────────────────────────────────

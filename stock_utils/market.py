@@ -73,11 +73,14 @@ def price(sym: Symbol) -> tuple[bool, float | None]:
     if not rt:
         raise LookupError(f"即時行情沒有 {sym.code} 的資料")
     t = now()
-    if rt["date"] == t.date() and _OPEN <= t.time() < _CLOSE:
-        # 盤中某一瞬間可能剛好沒有成交，那時用前一筆。
-        return True, rt["last"] or rt["prev_trade"] or rt["prev_close"]
-    # 收盤後 last 就是收盤價；開盤前還沒有成交，昨收就是「當前收盤價」。
-    return False, rt["last"] or rt["prev_close"]
+    trading = rt["date"] == t.date() and _OPEN <= t.time() < _CLOSE
+    if rt["last"]:
+        # 盤中是最後一筆成交價，收盤後就是收盤價。
+        return trading, rt["last"]
+    # 今天還沒有任何成交（開盤前、或冷門股開盤後還沒人買賣）：最新的價格
+    # 仍然是昨收，所以照「當前收盤價」回——★ 不能標成盤中即時價，那是
+    # 2026-10-05 開盤第一天實際發生的錯（見 sources.realtime）。
+    return False, rt["prev_close"]
 
 
 # ── 配息 ─────────────────────────────────────────────────────────

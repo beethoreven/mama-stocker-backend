@@ -47,7 +47,7 @@ if not db_connection.enabled():
 
 
 def _warm_up() -> None:
-    """先把全市場的那幾包抓進快取，第一個問股價的人不必在 5 秒裡等它們。
+    """把常用的那幾包抓進快取，快過期的提前重抓——使用者問的時候不必等。
 
     抓失敗沒關係，真的有人問的時候會再抓一次。
     """
@@ -63,24 +63,34 @@ def _warm_up() -> None:
         ("tpex_past_dividends", lambda: sources.tpex_past_dividends(date.today())),
         ("tpex_upcoming_dividends", sources.tpex_upcoming_dividends),
     ]
-    for name, load in loads:
-        started = time.perf_counter()
-        try:
-            n = len(load())
-            # 每一支都印：這台主機連不連得到資料來源，開機 log 就看得出來。
-            print(f"[warm] {name} {n} 筆，{time.perf_counter() - started:.1f} s",
-                  flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warn] 預抓 {name} 失敗（{time.perf_counter() - started:.1f} s）："
-                  f"{type(exc).__name__}: {exc}"[:300], flush=True)
+    with sources.refresh_ahead():
+        for name, load in loads:
+            started = time.perf_counter()
+            try:
+                n = len(load())
+                took = time.perf_counter() - started
+                if took > 0.05:
+                    # 真的有去抓才印（還在期限內的不印）。這台主機連不連得到
+                    # 資料來源、各要多久，log 就看得出來。
+                    print(f"[warm] {name} {n} 筆，{took:.1f} s", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] 預抓 {name} 失敗（{time.perf_counter() - started:.1f} s）："
+                      f"{type(exc).__name__}: {exc}"[:300], flush=True)
 
 
-_warm_started = threading.Event()
+# 多久預抓一次。要比「資料期限 − 提前量」（一小時 − 十五分鐘）短，資料才不會
+# 在兩次預抓之間過期。
+_WARM_EVERY = 600
+_warm_lock = threading.Lock()
+_warm_next = 0.0
 
 
 @app.before_request
 def _start_warm_up():
-    """第一個請求進來時才啟動預抓（保活的 /health 也算）。
+    """有請求進來時，如果距離上次預抓超過十分鐘，就在背景再抓一次。
+
+    靠請求來觸發，不是一條一直睡著等的執行緒：保活每幾分鐘會打一次 /health，
+    所以它實際上是定時的；而容器被凍結再醒來時，也不必指望背景執行緒還活著。
 
     ★ **不能在 import 的時候就開執行緒**。2026-10-04 上線第一天就是這樣壞的：
       在模組層開執行緒去預抓時，Render 上 worker 裡每一次對外連線都永遠卡住，
@@ -96,9 +106,18 @@ def _start_warm_up():
 
       規則：這個檔在載入階段不啟動任何執行緒、不對外連線。
     """
-    if not _warm_started.is_set():
-        _warm_started.set()
-        threading.Thread(target=_warm_up, name="warm-up", daemon=True).start()
+    global _warm_next
+    if time.monotonic() < _warm_next or not _warm_lock.acquire(blocking=False):
+        return
+    _warm_next = time.monotonic() + _WARM_EVERY
+
+    def run():
+        try:
+            _warm_up()
+        finally:
+            _warm_lock.release()
+
+    threading.Thread(target=run, name="warm-up", daemon=True).start()
 
 
 @app.get("/health")
