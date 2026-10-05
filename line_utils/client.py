@@ -63,3 +63,21 @@ def reply(reply_token: str, message: str | list[dict]) -> bool:
     except Exception as exc:  # noqa: BLE001 - 回覆失敗不該讓 webhook 回 5xx
         log.warning("LINE reply 例外: %s", exc)
         return False
+
+
+def group_member_name(group_id: str, user_id: str) -> str | None:
+    """群組成員的顯示名稱；查不到就 None。
+
+    ★ getProfile 只對「已加 bot 好友」的人有效，群組裡的人要用這一支。
+    """
+    if not enabled():
+        return None
+    try:
+        r = requests.get(
+            f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}",
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=3,
+        )
+        return r.json().get("displayName") if r.status_code < 400 else None
+    except Exception:  # noqa: BLE001 - 沒有名字還是可以記 id
+        return None

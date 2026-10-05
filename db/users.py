@@ -24,7 +24,7 @@ import threading
 import time
 
 from db import connection
-from db.schema import ensure_schema
+from db.schema import ensure_once
 
 log = logging.getLogger(__name__)
 
@@ -33,16 +33,12 @@ _CACHE_TTL_SECONDS = float(os.environ.get("AUTH_CACHE_TTL_SECONDS") or "60")
 _lock = threading.Lock()
 _allowed: frozenset[str] | None = None
 _expires_at = 0.0
-_schema_ready = False
 
 
 def _load() -> frozenset[str]:
-    global _schema_ready
     with connection.pool.connection() as conn:
         with conn.cursor() as cur:
-            if not _schema_ready:
-                ensure_schema(cur)
-                _schema_ready = True
+            ensure_once(cur)
             cur.execute(
                 "SELECT line_user_id FROM users "
                 " WHERE line_user_id IS NOT NULL AND status = 'active'"

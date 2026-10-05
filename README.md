@@ -42,8 +42,11 @@ gunicorn app:app --workers 1 --threads 8
 
 誰能用記在資料庫的 `users` 表（開機後第一次查詢時自動建立），沒有介面，用 SQL 管。
 
-1. 請對方加 bot 好友，**私訊**傳 `我的ID`，bot 會回一串 `U` 開頭的 userId。
-   這一步任何人都能做，回的是他自己的 id。
+1. 取得對方的 userId（U 開頭的一串），兩種方式擇一：
+   - **對方自己問**：加 bot 好友，**私訊**傳 `我的ID`。任何人都能做，回的是他自己的 id。
+   - **從群組取得**（對方什麼指令都不用學）：bot 在群組裡時，請對方在群組隨便說一句話
+     （不用 tag、不用加好友）；然後已開通的人**私訊** bot 傳 `群組名單`，
+     會列出在群組說過話、還沒開通的人的名字與 userId。
 2. 在資料庫執行：
 
    ```sql
@@ -117,8 +120,9 @@ line_utils/
   draw.py           用 Pillow 畫折線圖
 db/
   connection.py     每次請求各開一條連線（不用連線池，理由見檔案開頭）
-  schema.py         users 表
+  schema.py         users、group_speakers 兩張表
   users.py          這個 LINE 帳號能不能用（含一分鐘快取）
+  speakers.py       在群組說過話、還沒開通的人（給「群組名單」用）
 stock_utils/
   sources.py        一支函式對一個公開端點（含快取）
   market.py         把端點資料拼成股價、配息、殖利率、五年走勢

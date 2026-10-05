@@ -1,7 +1,7 @@
 """一則 LINE 事件 → 回什麼。
 
-這一層刻意不碰 HTTP 也不碰 requests：路由負責驗簽與取出事件，client 負責
-送訊息，資料由 stock_utils 查，這裡只決定「這則訊息代表什麼、該回哪一句」。
+路由負責驗簽與取出事件，client 負責呼叫 LINE，資料由 stock_utils 與 db 查，
+這裡只決定「這則訊息代表什麼、該回哪一句」。
 
 回覆的每一行字都是案主 2026-10-04 定的規格，改字之前先確認。
 """
@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from db import users
+from db import speakers, users
+from line_utils import client
 from line_utils import commands
 from line_utils.images import ImageReply
 from stock_utils import market
@@ -58,7 +59,35 @@ def is_my_id(event: dict, text: str) -> bool:
     return text.replace(" ", "").upper() in ("我的ID", "MYID")
 
 
-def handle_command(text: str, *, sender: str | None) -> str | ImageReply:
+def note_group_speaker(event: dict) -> None:
+    """群組裡有人說話（不必 tag 我）：還沒開通的人，把他的 userId 記下來。
+
+    之後已開通的人私訊「群組名單」就查得到，見 _group_list。
+    每個人只在這個行程第一次看到時記一次——那一次會多打一支 LINE API 查名字、
+    連一次資料庫；之後他說的每一句都是直接略過。
+    """
+    source = event.get("source") or {}
+    uid = source.get("userId")
+    if event.get("type") != "message" or source.get("type") != "group" or not uid:
+        return
+    if speakers.already_recorded(uid) or users.is_allowed(uid):
+        return
+    group_id = source.get("groupId")
+    name = client.group_member_name(group_id, uid) if group_id else None
+    speakers.record(uid, group_id, name)
+
+
+def _group_list() -> str:
+    people = speakers.pending()
+    if not people:
+        return "群組裡還沒有「說過話、但還沒開通」的人。\n請對方在群組裡隨便說一句話，再問我一次。"
+    lines = ["在群組說過話、還沒開通的人（最近說話的在前）："]
+    for name, uid in people:
+        lines += ["", name or "（查不到名字）", uid]
+    return "\n".join(lines)
+
+
+def handle_command(text: str, *, sender: str | None, private: bool) -> str | ImageReply:
     """處理一段已經清乾淨的指令文字，回傳要回覆的東西。
 
     多半是幾行字；走勢回的是 ImageReply，由 app.py 換成圖片訊息——網址要在
@@ -72,6 +101,10 @@ def handle_command(text: str, *, sender: str | None) -> str | ImageReply:
     #   2026-10-04）。
     if not users.is_allowed(sender):
         return commands.NO_PERMISSION
+
+    # 只在私訊回：群組裡回的話，別人的 userId 整個群組都看得到。
+    if private and text.replace(" ", "") == commands.GROUP_LIST:
+        return _group_list()
 
     kind, payload = commands.parse(text)
     if kind == commands.UNKNOWN:

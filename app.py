@@ -144,6 +144,11 @@ def line_webhook():
 
 
 def _handle_line_event(event: dict) -> None:
+    try:
+        line_handler.note_group_speaker(event)
+    except Exception as exc:  # noqa: BLE001 - 記不到名單不該擋住回覆
+        app.logger.warning("記錄群組發話者失敗：%s", exc)
+
     text = line_handler.text_to_me(event)
     if text is None:
         # 不是在跟我講話就完全不反應——不回覆、不記 log。群組裡大部分
@@ -161,8 +166,10 @@ def _handle_line_event(event: dict) -> None:
             line_client.reply(reply_token, f"你的 LINE userId：\n{sender}")
         return
 
+    private = (event.get("source") or {}).get("type") == "user"
     line_client.reply(
-        reply_token, _line_messages(line_handler.handle_command(text, sender=sender))
+        reply_token,
+        _line_messages(line_handler.handle_command(text, sender=sender, private=private)),
     )
 
 

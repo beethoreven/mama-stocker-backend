@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+_ready = False
+
+
+def ensure_once(cur) -> None:
+    """這個行程第一次碰資料庫時把表建好。之後呼叫都是空的。"""
+    global _ready
+    if not _ready:
+        ensure_schema(cur)
+        _ready = True
+
 
 def ensure_schema(cur) -> None:
+    _ensure_users(cur)
+    _ensure_group_speakers(cur)
+
+
+def _ensure_users(cur) -> None:
     """誰可以用這個 bot。
 
     ★ 沒有介面，用 SQL 管（這張表只有幾列）：
@@ -36,4 +51,25 @@ def ensure_schema(cur) -> None:
     cur.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_line_user_id_key "
         "ON users (line_user_id) WHERE line_user_id IS NOT NULL"
+    )
+
+
+def _ensure_group_speakers(cur) -> None:
+    """在群組裡說過話的人：開通之前，用來查出對方的 userId。
+
+    LINE 不讓一般帳號列出群組成員（那支 API 只給認證帳號），但群組裡每一則
+    訊息都會附上發話者的 userId。所以對方只要在群組說一句話，這裡就記得到，
+    不必教他私訊「我的ID」——要開通的是長輩。
+
+    一個人一列（重複說話只更新時間）。已經開通的人不記，見 db/speakers.py。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS group_speakers (
+            line_user_id TEXT PRIMARY KEY,
+            name         TEXT,
+            group_id     TEXT,
+            seen_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
     )
